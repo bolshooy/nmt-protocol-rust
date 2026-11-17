@@ -1,0 +1,25 @@
+[package]
+name = "nmt-protocol-rust"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.87"
+description = "NMT v2 secure protocol core: NMTB, certificates, handshake, sessions and rekey"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "nmt"
+path = "src/lib.rs"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+fips204 = { version = "0.5", default-features = false, features = ["ml-dsa-65", "default-rng"] }
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+ml-kem = { version = "0.3.4", features = ["getrandom"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+secp256k1 = "0.31"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2"
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
