@@ -1,49 +1,66 @@
 # nmt-protocol-rust
 
-Rust port of the **NMT v2 protocol core** from
+Rust-порт **ядра протокола NMT v2** из
 [`nmt-protocol-go`](../nmt-protocol-go).
 
-Scope: only the protocol library.
+Пакет: `nmt-protocol-rust`. Библиотека: `nmt`.
 
-- NMTB canonical binary format;
-- secp256k1 ECDSA + ML-DSA-65 keys and signatures;
-- NMT certificates (issuer/leaf, no X.509);
-- hybrid X25519 + ML-KEM-1024 handshake;
-- ChaCha20-Poly1305 frames with encrypted inner headers;
-- replay protection, session policy and in-band rekey;
-- WebSocket upgrade proof primitives.
+Реализован только протокол:
 
-Not included by request:
+- канонический бинарный формат **NMTB**;
+- ключи и подписи **secp256k1 ECDSA + ML-DSA-65**;
+- NMT-сертификаты issuer/leaf, без X.509;
+- гибридный handshake **X25519 + ML-KEM-1024**;
+- кадры **ChaCha20-Poly1305** с зашифрованными внутренними заголовками;
+- replay-защита, политика сессии и in-band rekey;
+- примитивы WebSocket upgrade proof.
+
+По запросу **не включены**:
 
 - HTTP/WebSocket server;
 - HTTP/WebSocket client;
-- `nmt-issuer-gen` CLI.
+- CLI `nmt-issuer-gen`.
 
-## Crypto
+## Документация протокола
 
-| Purpose | Algorithm |
+- [`NMT_SECURE_PROTOCOL.md`](../nmt-protocol-go/docs/NMT_SECURE_PROTOCOL.md) —
+  устройство протокола, сертификаты, handshake, кадры.
+- [`NMT_THREAT_MODEL.md`](../nmt-protocol-go/docs/NMT_THREAT_MODEL.md) —
+  модель угроз и остаточные риски.
+
+## Криптография
+
+| Назначение | Алгоритм |
 | --- | --- |
-| Key exchange | X25519 + ML-KEM-1024 |
-| Certificate and handshake signatures | secp256k1 ECDSA + ML-DSA-65 |
+| Обмен ключами | X25519 + ML-KEM-1024 |
+| Подписи сертификата и handshake | secp256k1 ECDSA + ML-DSA-65 |
 | KDF | HKDF-SHA-256 |
-| Session AEAD | ChaCha20-Poly1305 |
-| Transcript hash | SHA-256 |
+| Шифрование сессии | ChaCha20-Poly1305 |
+| Хеш transcript | SHA-256 |
 | WebSocket proof | HMAC-SHA-256 |
 
-Both signature schemes are mandatory.
+Обе схемы подписи обязательны: клиент проверяет и классическую, и
+постквантовую.
 
-## Modules
+## Модули
 
 ```text
-src/nmtb.rs          canonical NMTB codec
-src/keys.rs          server keys and hybrid signatures
-src/certificate.rs   NMT issuer/leaf certificates
-src/handshake.rs     hybrid handshake
-src/session.rs       frames, replay, policy, upgrade proof
+src/nmtb.rs          канонический NMTB codec
+src/keys.rs          ключи сервера и гибридные подписи
+src/certificate.rs   NMT issuer/leaf сертификаты
+src/handshake.rs     гибридный handshake
+src/session.rs       кадры, replay, политика, upgrade proof
 src/rekey.rs         in-band rekey
+src/error.rs         общий тип ошибок
+src/util.rs          timestamps и transcript helpers
 ```
 
-## Usage
+## Требования
+
+- Rust **1.87+**;
+- Windows/Linux/macOS.
+
+## Использование
 
 ### NMTB
 
@@ -59,7 +76,7 @@ let bytes = marshal(&value)?;
 assert_eq!(unmarshal(&bytes)?, value);
 ```
 
-### Keys and certificate
+### Ключи и сертификат
 
 ```rust
 use nmt::certificate::Certificate;
@@ -80,6 +97,8 @@ let certificate_bytes = certificate.marshal()?;
 let certificate = Certificate::parse(&certificate_bytes)?;
 certificate.verify(&issuer.public(), now)?;
 ```
+
+`not_before` и `not_after` — Unix milliseconds.
 
 ### Handshake
 
@@ -105,7 +124,10 @@ let mut client_session = client.finish(&server_hello)?;
 assert_eq!(client_session.id, server_session.id);
 ```
 
-### Encrypted frame
+Клиент анонимный. Сервер подтверждает себя сертификатом, подписанным
+запиненным issuer-ключом. `expected_server_id` проверяется, если задан.
+
+### Зашифрованный кадр
 
 ```rust
 use nmt::session::Kind;
@@ -114,6 +136,20 @@ use nmt::nmtb::Value;
 let frame = client_session.seal(Kind::Request, "ping", 1, &Value::Null)?;
 let request = server_session.open(&frame)?;
 assert_eq!(request.method, "ping");
+```
+
+Кадр NMT2:
+
+```text
+"NMT2" | version | handle[16] | nonce[12] | ciphertext | tag[16]
+```
+
+Внутри AEAD:
+
+```text
+inner_version | kind | flags | reserved |
+request_id | timestamp_ms | method_len | method |
+payload_len | NMTB payload
 ```
 
 ### Rekey
@@ -136,32 +172,53 @@ rekey.finish(&mut client_session, &response.payload)?;
 server_session.rotate(result.send_key, result.recv_key, now);
 ```
 
-## Compatibility
+Rekey не продлевает абсолютный TTL. Replay-кэш сохраняется при ротации.
 
-The Rust core is wire-compatible with the Go protocol:
+## Совместимость с Go
 
-- NMTB tags, varints, canonical maps and limits;
-- NMT v2 certificate and handshake field names;
-- `NMT2` frame layout and inner header;
-- HKDF domains and transcript construction;
-- rekey request/response and epoch checks.
+Rust-ядро wire-совместимо с Go-протоколом:
 
-Timestamps are `i64` Unix milliseconds. `SessionPolicy` uses milliseconds.
+- теги NMTB, varint, канонические map и лимиты;
+- имена полей сертификата и handshake NMT v2;
+- layout кадра `NMT2` и внутреннего заголовка;
+- HKDF-домены и построение transcript;
+- rekey request/response и проверка epoch.
 
-`Session` has an injectable clock for deterministic tests:
+Проверено на практике:
+
+- одинаковые NMTB-данные дают одинаковые байты в Go и Rust;
+- Rust проверяет сертификат, выпущенный Go;
+- Go проверяет сертификат, выпущенный Rust.
+
+Время — `i64` Unix milliseconds. `SessionPolicy` использует миллисекунды.
+
+Для детерминированных тестов можно подменить часы:
 
 ```rust
 session.set_clock(|| 1_700_000_000_000);
 ```
 
-## Tests
+## Тесты
 
 ```powershell
 cargo test
 cargo clippy --all-targets
 ```
 
-The test suite covers NMTB round-trips and canonical maps, key
-serialization, certificate issue/verify/tamper, handshake, clock skew,
-replay, encrypted frames, inner-header hiding, session policy, rekey and
-WebSocket proof.
+Покрыто:
+
+- NMTB round-trip, канонический порядок ключей и лимиты;
+- сериализация и восстановление ключей;
+- выпуск, парсинг, проверка и подмена сертификата;
+- handshake, неверный issuer, неверный `server_id`, clock skew;
+- replay handshake и кадров;
+- зашифрованные кадры и скрытие внутреннего заголовка;
+- политика сессии, TTL и idle timeout;
+- rekey, stale epoch и сохранение replay-кэша;
+- WebSocket upgrade proof.
+
+Текущий результат:
+
+```text
+25 passed; 0 failed
+```
