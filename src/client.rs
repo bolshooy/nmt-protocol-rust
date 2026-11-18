@@ -3,9 +3,9 @@
 //! The client establishes a certificate-authenticated session, sends sealed
 //! RPC frames over HTTP and consumes sealed events over WebSocket.
 
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::{HeaderValue, Request};
 use tungstenite::stream::MaybeTlsStream;
@@ -240,48 +240,85 @@ pub struct EventStream {
     done: bool,
 }
 
-impl Iterator for EventStream {
-    type Item = Result<Value, Error>;
+/// Result of one non-blocking event poll.
+#[derive(Debug)]
+pub enum EventPoll {
+    Event(Value),
+    Timeout,
+    Closed,
+}
 
-    fn next(&mut self) -> Option<Self::Item> {
+impl EventStream {
+    /// Configure the socket read timeout used by [`EventStream::poll`].
+    pub fn set_read_timeout(&mut self, timeout: Option<Duration>) -> Result<(), Error> {
+        match self.socket.get_mut() {
+            MaybeTlsStream::Plain(tcp) => tcp
+                .set_read_timeout(timeout)
+                .map_err(|err| Error::WebSocket(err.to_string())),
+            MaybeTlsStream::Rustls(tls) => tls
+                .sock
+                .set_read_timeout(timeout)
+                .map_err(|err| Error::WebSocket(err.to_string())),
+            _ => Err(Error::WebSocket("unsupported TLS stream".into())),
+        }
+    }
+
+    /// Poll one event without forcing the caller to block forever. A read
+    /// timeout is reported as [`EventPoll::Timeout`] when
+    /// [`EventStream::set_read_timeout`] is configured.
+    pub fn poll(&mut self) -> Result<EventPoll, Error> {
         if self.done {
-            return None;
+            return Ok(EventPoll::Closed);
         }
         loop {
             match self.socket.read() {
                 Ok(Message::Binary(data)) => {
-                    let frame = match lock(&self.session).open(&data) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            self.done = true;
-                            return Some(Err(error));
-                        }
-                    };
+                    let frame = lock(&self.session).open(&data)?;
                     if frame.kind != Kind::Event {
                         continue;
                     }
                     let handle = lock(&self.session).handle_hex();
                     if is_rekey_event(&frame.payload, &handle) {
-                        if let Err(error) = self.client.rekey_internal(true) {
-                            self.done = true;
-                            return Some(Err(error));
-                        }
+                        self.client.rekey_internal(true)?;
                         continue;
                     }
-                    return Some(Ok(frame.payload));
+                    return Ok(EventPoll::Event(frame.payload));
                 }
                 Ok(Message::Ping(payload)) => {
-                    if let Err(error) = self.socket.send(Message::Pong(payload)) {
-                        self.done = true;
-                        return Some(Err(Error::WebSocket(error.to_string())));
-                    }
+                    self.socket
+                        .send(Message::Pong(payload))
+                        .map_err(|err| Error::WebSocket(err.to_string()))?;
                 }
                 Ok(Message::Pong(_)) | Ok(Message::Frame(_)) => {}
                 Ok(Message::Text(_)) => continue,
-                Ok(Message::Close(_)) | Err(_) => {
+                Ok(Message::Close(_)) => {
                     self.done = true;
-                    return None;
+                    return Ok(EventPoll::Closed);
                 }
+                Err(tungstenite::Error::Io(error))
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return Ok(EventPoll::Timeout);
+                }
+                Err(error) => {
+                    self.done = true;
+                    return Err(Error::WebSocket(error.to_string()));
+                }
+            }
+        }
+    }
+}
+
+impl Iterator for EventStream {
+    type Item = Result<Value, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            match self.poll() {
+                Ok(EventPoll::Event(value)) => return Some(Ok(value)),
+                Ok(EventPoll::Timeout) => continue,
+                Ok(EventPoll::Closed) => return None,
+                Err(error) => return Some(Err(error)),
             }
         }
     }

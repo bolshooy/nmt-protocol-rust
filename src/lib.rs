@@ -16,7 +16,7 @@ pub mod session;
 mod util;
 
 pub use certificate::Certificate;
-pub use client::{Client, EventStream};
+pub use client::{Client, EventPoll, EventStream};
 pub use error::Error;
 pub use handshake::{ClientHandshake, HANDSHAKE_TRANSCRIPT_DOMAIN, SessionKeys, VERSION};
 pub use keys::{ServerPublicKeys, parse_server_public_keys};
