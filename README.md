@@ -1,224 +1,124 @@
 # nmt-protocol-rust
 
-Rust-порт **ядра протокола NMT v2** из
-[`nmt-protocol-go`](../nmt-protocol-go).
+Rust-клиент протокола **NMT v2**.
 
-Пакет: `nmt-protocol-rust`. Библиотека: `nmt`.
+Крейт: `nmt-protocol-rust`, библиотека: `nmt`.
 
-Реализован только протокол:
+Клиент умеет:
 
-- канонический бинарный формат **NMTB**;
-- ключи и подписи **secp256k1 ECDSA + ML-DSA-65**;
-- NMT-сертификаты issuer/leaf, без X.509;
+- NMTB-кодирование и декодирование;
+- проверку сертификата сервера по pinned issuer-ключам;
 - гибридный handshake **X25519 + ML-KEM-1024**;
-- кадры **ChaCha20-Poly1305** с зашифрованными внутренними заголовками;
-- replay-защита, политика сессии и in-band rekey;
-- примитивы WebSocket upgrade proof.
+- AEAD-кадры **ChaCha20-Poly1305**;
+- replay-защиту и absolute/idle TTL;
+- in-band rekey;
+- WebSocket upgrade proof;
+- HTTP-вызовы `/v1/handshake`, `/v1/rpc`;
+- WebSocket `/v1/events` с автоматической обработкой серверного `session.rekey`.
 
-По запросу **не включены**:
-
-- HTTP/WebSocket server;
-- HTTP/WebSocket client;
-- CLI `nmt-issuer-gen`.
+Серверной части в этом крейте нет: сервер, выдача сертификатов, private keys
+и HTTP/WebSocket серверная реализация удалены. Сертификаты и ключи
+генерируются внешним инструментом, например Go-утилитой
+[`nmt-issuer-gen`](../nmt-protocol-go/cmd/nmt-issuer-gen).
 
 ## Документация протокола
 
 - [`NMT_SECURE_PROTOCOL.md`](../nmt-protocol-go/docs/NMT_SECURE_PROTOCOL.md) —
-  устройство протокола, сертификаты, handshake, кадры.
+  формат, сертификаты, handshake, кадры.
 - [`NMT_THREAT_MODEL.md`](../nmt-protocol-go/docs/NMT_THREAT_MODEL.md) —
-  модель угроз и остаточные риски.
+  модель угроз и ограничения.
 
 ## Криптография
 
 | Назначение | Алгоритм |
 | --- | --- |
 | Обмен ключами | X25519 + ML-KEM-1024 |
-| Подписи сертификата и handshake | secp256k1 ECDSA + ML-DSA-65 |
+| Аутентификация сервера | secp256k1 ECDSA + ML-DSA-65 |
 | KDF | HKDF-SHA-256 |
-| Шифрование сессии | ChaCha20-Poly1305 |
+| Шифрование кадров | ChaCha20-Poly1305 |
 | Хеш transcript | SHA-256 |
 | WebSocket proof | HMAC-SHA-256 |
 
-Обе схемы подписи обязательны: клиент проверяет и классическую, и
-постквантовую.
+Клиент анонимный: сертификат подтверждает только сервер. Приложение
+аутентифицирует пользователя/устройство поверх NMT RPC.
 
-## Модули
+## Структура
 
 ```text
-src/nmtb.rs          канонический NMTB codec
-src/keys.rs          ключи сервера и гибридные подписи
-src/certificate.rs   NMT issuer/leaf сертификаты
-src/handshake.rs     гибридный handshake
-src/session.rs       кадры, replay, политика, upgrade proof
-src/rekey.rs         in-band rekey
-src/error.rs         общий тип ошибок
+src/nmtb.rs          NMTB codec
+src/keys.rs          pinned server public keys и проверка подписей
+src/certificate.rs   разбор и проверка NMT-сертификата
+src/handshake.rs     клиентский handshake
+src/session.rs       сессия, кадры, replay, rekey state
+src/rekey.rs         клиентский in-band rekey
+src/client.rs        HTTP + WebSocket клиент
+src/error.rs         ошибки
 src/util.rs          timestamps и transcript helpers
 ```
+
+## Использование
+
+```rust
+use nmt::Client;
+use nmt::keys::parse_server_public_keys;
+use nmt::nmtb::Value;
+
+let issuer = parse_server_public_keys(&issuer_secp, &issuer_mldsa)?;
+
+let mut client = Client::new("http://127.0.0.1:8080", issuer)?
+    .with_server_id("server-1");
+
+client.handshake()?;
+
+// Любой RPC-метод.
+let pong = client.ping()?;
+let response = client.call("env.info", &Value::map(Default::default()))?;
+
+// Подписка на события. Внутренний session.rekey обрабатывается автоматически.
+let events = client.events()?;
+for event in events {
+    let event = event?;
+    println!("{event:?}");
+}
+
+// Ротация по серверной политике.
+if client.needs_rekey() {
+    client.rekey()?;
+}
+
+client.logout()?;
+```
+
+`Client::call` работает с `nmtb::Value`. Это нижний уровень, на котором
+удобно строить собственные типизированные обёртки.
+
+## Rekey
+
+Политика задаётся сервером и приходит в handshake:
+
+- `rekey_messages` — после скольких application-запросов менять ключи;
+- `rekey_interval_ms` — верхняя граница по времени.
+
+Клиент не может ускорить rekey: `Client::rekey` — no-op, пока политика не
+разрешит. Когда сервер публикует `session.rekey`, `EventStream` выполняет
+rekey автоматически и не отдаёт это событие приложению.
 
 ## Требования
 
 - Rust **1.87+**;
 - Windows/Linux/macOS.
 
-## Использование
-
-### NMTB
-
-```rust
-use std::collections::BTreeMap;
-use nmt::nmtb::{marshal, unmarshal, Value};
-
-let mut map = BTreeMap::new();
-map.insert("hello".to_string(), Value::String("world".to_string()));
-let value = Value::Map(map);
-
-let bytes = marshal(&value)?;
-assert_eq!(unmarshal(&bytes)?, value);
-```
-
-### Ключи и сертификат
-
-```rust
-use nmt::certificate::Certificate;
-use nmt::keys::ServerKeys;
-
-let now = 1_700_000_000_000i64;
-let issuer = ServerKeys::generate()?;
-let leaf = ServerKeys::generate()?;
-
-let certificate = Certificate::issue(
-    &leaf,
-    &issuer,
-    "server-1",
-    now - 60_000,
-    now + 3_600_000,
-)?;
-let certificate_bytes = certificate.marshal()?;
-let certificate = Certificate::parse(&certificate_bytes)?;
-certificate.verify(&issuer.public(), now)?;
-```
-
-`not_before` и `not_after` — Unix milliseconds.
-
-### Handshake
-
-```rust
-use nmt::handshake::{server_handshake, ClientHandshake, ServerHandshakeOptions};
-use nmt::session::SessionPolicy;
-
-let (mut client, client_hello) =
-    ClientHandshake::new(issuer.public(), now, "server-1")?;
-
-let (server_hello, mut server_session) = server_handshake(
-    &client_hello,
-    ServerHandshakeOptions {
-        keys: &leaf,
-        certificate: &certificate_bytes,
-        replay_seen: None,
-        now_ms: now,
-        policy: SessionPolicy::default(),
-    },
-)?;
-
-let mut client_session = client.finish(&server_hello)?;
-assert_eq!(client_session.id, server_session.id);
-```
-
-Клиент анонимный. Сервер подтверждает себя сертификатом, подписанным
-запиненным issuer-ключом. `expected_server_id` проверяется, если задан.
-
-### Зашифрованный кадр
-
-```rust
-use nmt::session::Kind;
-use nmt::nmtb::Value;
-
-let frame = client_session.seal(Kind::Request, "ping", 1, &Value::Null)?;
-let request = server_session.open(&frame)?;
-assert_eq!(request.method, "ping");
-```
-
-Кадр NMT2:
-
-```text
-"NMT2" | version | handle[16] | nonce[12] | ciphertext | tag[16]
-```
-
-Внутри AEAD:
-
-```text
-inner_version | kind | flags | reserved |
-request_id | timestamp_ms | method_len | method |
-payload_len | NMTB payload
-```
-
-### Rekey
-
-```rust
-use nmt::rekey::{server_rekey, RekeyClient};
-
-let (mut rekey, payload) =
-    RekeyClient::new(&client_session, leaf.public(), now)?;
-
-let frame = client_session.seal(Kind::Request, "session.rekey", 2, &payload)?;
-let request = server_session.open(&frame)?;
-
-let result = server_rekey(&server_session, &request.payload, &leaf, now)?;
-let response_frame =
-    server_session.seal(Kind::Response, "session.rekey", 2, &result.response)?;
-let response = client_session.open(&response_frame)?;
-
-rekey.finish(&mut client_session, &response.payload)?;
-server_session.rotate(result.send_key, result.recv_key, now);
-```
-
-Rekey не продлевает абсолютный TTL. Replay-кэш сохраняется при ротации.
-
-## Совместимость с Go
-
-Rust-ядро wire-совместимо с Go-протоколом:
-
-- теги NMTB, varint, канонические map и лимиты;
-- имена полей сертификата и handshake NMT v2;
-- layout кадра `NMT2` и внутреннего заголовка;
-- HKDF-домены и построение transcript;
-- rekey request/response и проверка epoch.
-
-Проверено на практике:
-
-- одинаковые NMTB-данные дают одинаковые байты в Go и Rust;
-- Rust проверяет сертификат, выпущенный Go;
-- Go проверяет сертификат, выпущенный Rust.
-
-Время — `i64` Unix milliseconds. `SessionPolicy` использует миллисекунды.
-
-Для детерминированных тестов можно подменить часы:
-
-```rust
-session.set_clock(|| 1_700_000_000_000);
-```
-
-## Тесты
+## Сборка и тесты
 
 ```powershell
+cargo build
 cargo test
 cargo clippy --all-targets
 ```
 
-Покрыто:
+## Ограничения
 
-- NMTB round-trip, канонический порядок ключей и лимиты;
-- сериализация и восстановление ключей;
-- выпуск, парсинг, проверка и подмена сертификата;
-- handshake, неверный issuer, неверный `server_id`, clock skew;
-- replay handshake и кадров;
-- зашифрованные кадры и скрытие внутреннего заголовка;
-- политика сессии, TTL и idle timeout;
-- rekey, stale epoch и сохранение replay-кэша;
-- WebSocket upgrade proof.
-
-Текущий результат:
-
-```text
-25 passed; 0 failed
-```
+- только клиент;
+- сертификаты и приватные ключи не генерируются;
+- typed RPC на уровне структур пока не портирован — API использует
+  `nmtb::Value`.

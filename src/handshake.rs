@@ -4,23 +4,18 @@
 use std::collections::BTreeMap;
 
 use hkdf::Hkdf;
-use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, MlKem1024, TryKeyInit};
+use ml_kem::{Decapsulate, Kem, KeyExport, MlKem1024};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::certificate::{MAX_CERTIFICATE_SIZE, verify_certificate};
 use crate::error::Error;
-use crate::keys::{
-    ServerKeys, ServerPublicKeys, parse_server_public_keys, verify_server_signatures,
-};
+use crate::keys::{ServerPublicKeys, parse_server_public_keys, verify_server_signatures};
 use crate::nmtb::{self, Value};
 use crate::session::{Session, SessionPolicy};
 use crate::util::check_timestamp;
 
 pub const VERSION: i64 = 2;
-
-/// Callback used to reject replayed ClientHello nonces.
-pub type ReplaySeen<'a> = &'a mut dyn FnMut(&[u8]) -> bool;
 
 /// `(c2s, s2c, session_id, handle)`.
 pub type SessionKeys = ([u8; 32], [u8; 32], [u8; 16], [u8; 16]);
@@ -125,10 +120,12 @@ impl ClientHandshake {
         let ttl_ms = map_int(message, "ttl_ms")?;
         let idle_ms = map_int(message, "idle_ms")?;
         let rekey_ms = map_int(message, "rekey_ms")?;
+        let rekey_messages = map_int(message, "rekey_messages")?;
         let policy = SessionPolicy {
             ttl_ms,
             idle_timeout_ms: idle_ms,
             rekey_interval_ms: rekey_ms,
+            rekey_messages,
         }
         .normalized();
 
@@ -148,6 +145,7 @@ impl ClientHandshake {
         server_map.insert("ttl_ms".into(), Value::Int(ttl_ms));
         server_map.insert("idle_ms".into(), Value::Int(idle_ms));
         server_map.insert("rekey_ms".into(), Value::Int(rekey_ms));
+        server_map.insert("rekey_messages".into(), Value::Int(rekey_messages));
         let server_unsigned = nmtb::marshal(&Value::Map(server_map))?;
         let transcript = handshake_transcript(
             &self.unsigned,
@@ -180,130 +178,6 @@ impl ClientHandshake {
             policy,
         ))
     }
-}
-
-/// Server-side handshake options.
-pub struct ServerHandshakeOptions<'a> {
-    pub keys: &'a ServerKeys,
-    pub certificate: &'a [u8],
-    pub replay_seen: Option<ReplaySeen<'a>>,
-    pub now_ms: i64,
-    pub policy: SessionPolicy,
-}
-
-/// Process ClientHello and return ServerHello plus the server session.
-pub fn server_handshake(
-    request: &[u8],
-    mut options: ServerHandshakeOptions<'_>,
-) -> Result<(Vec<u8>, Session), Error> {
-    if options.certificate.is_empty() {
-        return Err(Error::Message("server certificate is required".into()));
-    }
-    let value =
-        nmtb::unmarshal(request).map_err(|err| Error::Handshake(format!("decode: {err}")))?;
-    let message = value
-        .as_map()
-        .ok_or_else(|| Error::Handshake("expected a map".into()))?;
-    if let Some(ok) = message.get("ok").and_then(Value::as_bool) {
-        if !ok {
-            return Err(handshake_error(message));
-        }
-    }
-
-    let version = map_int(message, "version")?;
-    if version != VERSION {
-        return Err(Error::Handshake("unsupported version".into()));
-    }
-    let client_nonce = map_bytes(message, "client_nonce", 32, 32)?;
-    let client_x25519 = map_bytes(message, "client_x25519", 32, 32)?;
-    let client_mlkem = map_bytes(message, "client_mlkem", 1, 4096)?;
-    let timestamp = map_int(message, "timestamp")?;
-    check_timestamp(options.now_ms, timestamp)?;
-    if let Some(replay_seen) = options.replay_seen.as_mut() {
-        if replay_seen(&client_nonce) {
-            return Err(Error::HandshakeReplay);
-        }
-    }
-
-    let mut client_map = BTreeMap::new();
-    client_map.insert("version".into(), Value::Int(version));
-    client_map.insert("client_nonce".into(), Value::Bytes(client_nonce.clone()));
-    client_map.insert("client_x25519".into(), Value::Bytes(client_x25519.clone()));
-    client_map.insert("client_mlkem".into(), Value::Bytes(client_mlkem.clone()));
-    client_map.insert("timestamp".into(), Value::Int(timestamp));
-    let client_unsigned = nmtb::marshal(&Value::Map(client_map))?;
-    if client_unsigned != request {
-        return Err(Error::Handshake("non-canonical ClientHello".into()));
-    }
-
-    let x_private = StaticSecret::from(random_array::<32>()?);
-    let x_public = X25519PublicKey::from(&x_private);
-    let client_public = X25519PublicKey::from(array_32(&client_x25519)?);
-    let x_shared = x_private.diffie_hellman(&client_public);
-
-    let encapsulation_key =
-        <<MlKem1024 as Kem>::EncapsulationKey as TryKeyInit>::new_from_slice(&client_mlkem)
-            .map_err(|_| Error::Handshake("client ml-kem key is invalid".into()))?;
-    let (mlkem_ciphertext, mlkem_shared) = encapsulation_key.encapsulate();
-
-    let server_nonce = crate::keys::random_bytes(32)?;
-    let policy = options.policy.normalized();
-    let mut server_map = BTreeMap::new();
-    server_map.insert("version".into(), Value::Int(VERSION));
-    server_map.insert("server_nonce".into(), Value::Bytes(server_nonce.clone()));
-    server_map.insert(
-        "server_x25519".into(),
-        Value::Bytes(x_public.as_bytes().to_vec()),
-    );
-    server_map.insert(
-        "mlkem_ciphertext".into(),
-        Value::Bytes(mlkem_ciphertext.as_slice().to_vec()),
-    );
-    server_map.insert("timestamp".into(), Value::Int(options.now_ms));
-    server_map.insert(
-        "certificate".into(),
-        Value::Bytes(options.certificate.to_vec()),
-    );
-    server_map.insert("ttl_ms".into(), Value::Int(policy.ttl_ms));
-    server_map.insert("idle_ms".into(), Value::Int(policy.idle_timeout_ms));
-    server_map.insert("rekey_ms".into(), Value::Int(policy.rekey_interval_ms));
-    let server_unsigned = nmtb::marshal(&Value::Map(server_map))?;
-    let transcript = handshake_transcript(
-        &client_unsigned,
-        &server_unsigned,
-        &client_nonce,
-        &server_nonce,
-    );
-    let (secp_signature, mldsa_signature) = options.keys.sign(&transcript)?;
-    let (c2s, s2c, session_id, handle) =
-        derive_session_keys(x_shared.as_bytes(), mlkem_shared.as_slice(), &transcript)?;
-
-    let mut response = BTreeMap::new();
-    response.insert("version".into(), Value::Int(VERSION));
-    response.insert("server_nonce".into(), Value::Bytes(server_nonce));
-    response.insert(
-        "server_x25519".into(),
-        Value::Bytes(x_public.as_bytes().to_vec()),
-    );
-    response.insert(
-        "mlkem_ciphertext".into(),
-        Value::Bytes(mlkem_ciphertext.as_slice().to_vec()),
-    );
-    response.insert("timestamp".into(), Value::Int(options.now_ms));
-    response.insert(
-        "certificate".into(),
-        Value::Bytes(options.certificate.to_vec()),
-    );
-    response.insert("ttl_ms".into(), Value::Int(policy.ttl_ms));
-    response.insert("idle_ms".into(), Value::Int(policy.idle_timeout_ms));
-    response.insert("rekey_ms".into(), Value::Int(policy.rekey_interval_ms));
-    response.insert("signature_secp256k1".into(), Value::Bytes(secp_signature));
-    response.insert("signature_mldsa".into(), Value::Bytes(mldsa_signature));
-    response.insert("session_id".into(), Value::Bytes(session_id.to_vec()));
-    let response = nmtb::marshal(&Value::Map(response))?;
-
-    let session = Session::new(session_id, handle, s2c, c2s, options.now_ms, policy);
-    Ok((response, session))
 }
 
 fn handshake_transcript(
@@ -396,181 +270,4 @@ fn array_32(value: &[u8]) -> Result<[u8; 32], Error> {
     value
         .try_into()
         .map_err(|_| Error::Handshake("expected 32 bytes".into()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::certificate::Certificate;
-    use crate::keys::ServerKeys;
-
-    fn now() -> i64 {
-        1_700_000_000_000
-    }
-
-    fn fixture() -> (ServerKeys, ServerKeys, Vec<u8>) {
-        let issuer = ServerKeys::generate().unwrap();
-        let leaf = ServerKeys::generate().unwrap();
-        let certificate = Certificate::issue(
-            &leaf,
-            &issuer,
-            "server-1",
-            now() - 60_000,
-            now() + 3_600_000,
-        )
-        .unwrap()
-        .marshal()
-        .unwrap();
-        (issuer, leaf, certificate)
-    }
-
-    #[test]
-    fn handshake_and_frames() {
-        let (issuer, leaf, certificate) = fixture();
-        let (mut client, request) =
-            ClientHandshake::new(issuer.public(), now(), "server-1").unwrap();
-        let (response, mut server_session) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: None,
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        let mut client_session = client.finish(&response).unwrap();
-        client_session.set_clock(now);
-        server_session.set_clock(now);
-        assert_eq!(client_session.id, server_session.id);
-        assert_eq!(client_session.handle, server_session.handle);
-        assert_ne!(client_session.handle, client_session.id);
-        assert_eq!(client.server_keys().unwrap(), &leaf.public());
-
-        let payload = Value::Map(BTreeMap::new());
-        let frame = client_session
-            .seal(crate::session::Kind::Request, "ping", 1, &payload)
-            .unwrap();
-        let decoded = server_session.open(&frame).unwrap();
-        assert_eq!(decoded.method, "ping");
-        assert_eq!(decoded.request_id, 1);
-        assert!(matches!(
-            server_session.open(&frame),
-            Err(Error::FrameReplay)
-        ));
-    }
-
-    #[test]
-    fn rejects_wrong_issuer_and_server_id() {
-        let (issuer, leaf, certificate) = fixture();
-        let (mut client, request) = ClientHandshake::new(issuer.public(), now(), "other").unwrap();
-        let (response, _) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: None,
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        assert!(client.finish(&response).is_err());
-
-        let other_issuer = ServerKeys::generate().unwrap();
-        let (mut client, request) =
-            ClientHandshake::new(other_issuer.public(), now(), "server-1").unwrap();
-        let (response, _) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: None,
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        assert!(client.finish(&response).is_err());
-    }
-
-    #[test]
-    fn rejects_replay_and_clock_skew() {
-        let (issuer, leaf, certificate) = fixture();
-        let mut seen = false;
-        let (mut client, request) =
-            ClientHandshake::new(issuer.public(), now(), "server-1").unwrap();
-        let mut replay = |_: &[u8]| {
-            if seen {
-                true
-            } else {
-                seen = true;
-                false
-            }
-        };
-        let (response, _) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: Some(&mut replay),
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        client.finish(&response).unwrap();
-        assert!(matches!(
-            server_handshake(
-                &request,
-                ServerHandshakeOptions {
-                    keys: &leaf,
-                    certificate: &certificate,
-                    replay_seen: Some(&mut replay),
-                    now_ms: now(),
-                    policy: SessionPolicy::default(),
-                },
-            ),
-            Err(Error::HandshakeReplay)
-        ));
-
-        let (_, request) =
-            ClientHandshake::new(issuer.public(), now() - 3_600_000, "server-1").unwrap();
-        assert!(matches!(
-            server_handshake(
-                &request,
-                ServerHandshakeOptions {
-                    keys: &leaf,
-                    certificate: &certificate,
-                    replay_seen: None,
-                    now_ms: now(),
-                    policy: SessionPolicy::default(),
-                },
-            ),
-            Err(Error::ClockSkew)
-        ));
-    }
-
-    #[test]
-    fn rejects_tampered_server_hello() {
-        let (issuer, leaf, certificate) = fixture();
-        let (mut client, request) =
-            ClientHandshake::new(issuer.public(), now(), "server-1").unwrap();
-        let (response, _) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: None,
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        let mut tampered = response;
-        let last = tampered.len() - 1;
-        tampered[last] ^= 0xff;
-        assert!(client.finish(&tampered).is_err());
-    }
 }

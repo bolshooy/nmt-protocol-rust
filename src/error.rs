@@ -30,6 +30,21 @@ pub enum Error {
     #[error("session expired")]
     SessionExpired,
 
+    #[error("not authenticated")]
+    NotAuthenticated,
+
+    #[error("API error {code}: {message}")]
+    Api { code: String, message: String },
+
+    #[error("HTTP transport: {0}")]
+    Http(String),
+
+    #[error("WebSocket transport: {0}")]
+    WebSocket(String),
+
+    #[error("protocol: {0}")]
+    Protocol(String),
+
     #[error("crypto: {0}")]
     Crypto(String),
 

@@ -8,9 +8,7 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 use crate::error::Error;
-use crate::keys::{
-    ServerKeys, ServerPublicKeys, parse_server_public_keys, verify_server_signatures,
-};
+use crate::keys::{ServerPublicKeys, parse_server_public_keys, verify_server_signatures};
 use crate::nmtb::{self, Value};
 use crate::util::{bytes_field, int_field, signing_input, string_field};
 
@@ -33,39 +31,6 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    /// Sign the subject's public keys with the issuer key.
-    pub fn issue(
-        subject: &ServerKeys,
-        issuer: &ServerKeys,
-        server_id: impl Into<String>,
-        not_before: i64,
-        not_after: i64,
-    ) -> Result<Self, Error> {
-        let server_id = server_id.into();
-        if server_id.is_empty() || server_id.len() > 128 {
-            return Err(Error::Certificate("invalid server id".into()));
-        }
-        if not_after <= not_before {
-            return Err(Error::Certificate("invalid validity window".into()));
-        }
-        let public = subject.public();
-        let mut certificate = Self {
-            server_id,
-            not_before,
-            not_after,
-            secp256k1: public.secp256k1,
-            mldsa: public.mldsa,
-            secp256k1_signature: Vec::new(),
-            mldsa_signature: Vec::new(),
-        };
-        let unsigned = certificate.unsigned_bytes()?;
-        let (secp256k1_signature, mldsa_signature) =
-            issuer.sign(&signing_input(CERTIFICATE_DOMAIN, &unsigned))?;
-        certificate.secp256k1_signature = secp256k1_signature;
-        certificate.mldsa_signature = mldsa_signature;
-        Ok(certificate)
-    }
-
     /// Encode the certificate as canonical NMTB.
     pub fn marshal(&self) -> Result<Vec<u8>, Error> {
         let mut map = BTreeMap::new();
@@ -190,67 +155,4 @@ pub fn verify_certificate(
     let certificate = Certificate::parse(data)?;
     certificate.verify(issuer, now_ms)?;
     Ok(certificate)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::keys::ServerKeys;
-
-    #[test]
-    fn issue_parse_verify() {
-        let issuer = ServerKeys::generate().unwrap();
-        let subject = ServerKeys::generate().unwrap();
-        let now = 1_700_000_000_000i64;
-        let certificate =
-            Certificate::issue(&subject, &issuer, "server-1", now - 60_000, now + 3_600_000)
-                .unwrap();
-        let data = certificate.marshal().unwrap();
-        let parsed = Certificate::parse(&data).unwrap();
-        parsed.verify(&issuer.public(), now).unwrap();
-        assert_eq!(parsed.public(), subject.public());
-        assert_eq!(parsed.server_id, "server-1");
-        assert_eq!(parsed.fingerprint(), certificate.fingerprint());
-    }
-
-    #[test]
-    fn rejects_wrong_issuer_and_expiry() {
-        let issuer = ServerKeys::generate().unwrap();
-        let other = ServerKeys::generate().unwrap();
-        let subject = ServerKeys::generate().unwrap();
-        let now = 1_700_000_000_000i64;
-        let certificate =
-            Certificate::issue(&subject, &issuer, "server-1", now - 60_000, now + 3_600_000)
-                .unwrap();
-        assert!(certificate.verify(&other.public(), now).is_err());
-        assert!(
-            certificate
-                .verify(&issuer.public(), now + 7_200_000)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn rejects_tampering() {
-        let issuer = ServerKeys::generate().unwrap();
-        let subject = ServerKeys::generate().unwrap();
-        let now = 1_700_000_000_000i64;
-        let certificate =
-            Certificate::issue(&subject, &issuer, "server-1", now - 60_000, now + 3_600_000)
-                .unwrap();
-        let mut data = certificate.marshal().unwrap();
-        let last = data.len() - 1;
-        data[last] ^= 0xff;
-        if let Ok(parsed) = Certificate::parse(&data) {
-            assert!(parsed.verify(&issuer.public(), now).is_err());
-        }
-    }
-
-    #[test]
-    fn rejects_bad_window() {
-        let issuer = ServerKeys::generate().unwrap();
-        let subject = ServerKeys::generate().unwrap();
-        assert!(Certificate::issue(&subject, &issuer, "x", 10, 10).is_err());
-        assert!(Certificate::issue(&subject, &issuer, "", 1, 2).is_err());
-    }
 }

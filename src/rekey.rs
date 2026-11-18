@@ -3,13 +3,13 @@
 use std::collections::BTreeMap;
 
 use hkdf::Hkdf;
-use ml_kem::{Decapsulate, Encapsulate, Kem, KeyExport, MlKem1024, TryKeyInit};
+use ml_kem::{Decapsulate, Kem, KeyExport, MlKem1024};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::error::Error;
 use crate::handshake::VERSION;
-use crate::keys::{ServerKeys, ServerPublicKeys, random_bytes, verify_server_signatures};
+use crate::keys::{ServerPublicKeys, random_bytes, verify_server_signatures};
 use crate::nmtb::{self, Value};
 use crate::session::Session;
 use crate::util::check_timestamp;
@@ -26,14 +26,6 @@ pub struct RekeyClient {
     session_id: [u8; 16],
     epoch: u64,
     now_ms: i64,
-}
-
-/// Response plus the next key set. The caller seals the response with the old
-/// keys, then calls `Session::rotate`.
-pub struct RekeyResult {
-    pub response: Value,
-    pub send_key: [u8; 32],
-    pub recv_key: [u8; 32],
 }
 
 impl RekeyClient {
@@ -147,101 +139,6 @@ impl RekeyClient {
     }
 }
 
-/// Process a rekey request and return the response plus the next server keys.
-pub fn server_rekey(
-    session: &Session,
-    request: &Value,
-    keys: &ServerKeys,
-    now_ms: i64,
-) -> Result<RekeyResult, Error> {
-    if session.expired(now_ms) {
-        return Err(Error::SessionExpired);
-    }
-    let map = request
-        .as_map()
-        .ok_or_else(|| Error::Message("invalid rekey request".into()))?;
-    let version = map_int(map, "version")?;
-    if version != VERSION {
-        return Err(Error::Handshake("unsupported version".into()));
-    }
-    let request_epoch = map_int(map, "epoch")?;
-    let epoch = session.epoch();
-    if request_epoch < 0 || request_epoch as u64 != epoch {
-        return Err(Error::Message("stale rekey epoch".into()));
-    }
-    let client_nonce = map_bytes(map, "client_nonce", 32, 32)?;
-    let client_x25519 = map_bytes(map, "client_x25519", 32, 32)?;
-    let client_mlkem = map_bytes(map, "client_mlkem", 1, 4096)?;
-    let timestamp = map_int(map, "timestamp")?;
-    check_timestamp(now_ms, timestamp)?;
-
-    let mut client_map = BTreeMap::new();
-    client_map.insert("version".into(), Value::Int(version));
-    client_map.insert("epoch".into(), Value::Int(request_epoch));
-    client_map.insert("client_nonce".into(), Value::Bytes(client_nonce.clone()));
-    client_map.insert("client_x25519".into(), Value::Bytes(client_x25519.clone()));
-    client_map.insert("client_mlkem".into(), Value::Bytes(client_mlkem.clone()));
-    client_map.insert("timestamp".into(), Value::Int(timestamp));
-    let client_unsigned = nmtb::marshal(&Value::Map(client_map))?;
-
-    let x_private = StaticSecret::from(random_array::<32>()?);
-    let x_public = X25519PublicKey::from(&x_private);
-    let client_public = X25519PublicKey::from(array_32(&client_x25519)?);
-    let x_shared = x_private.diffie_hellman(&client_public);
-    let encapsulation_key =
-        <<MlKem1024 as Kem>::EncapsulationKey as TryKeyInit>::new_from_slice(&client_mlkem)
-            .map_err(|_| Error::Handshake("client ml-kem key is invalid".into()))?;
-    let (mlkem_ciphertext, mlkem_shared) = encapsulation_key.encapsulate();
-    let server_nonce = random_bytes(32)?;
-    let server_timestamp = now_ms;
-
-    let mut server_map = BTreeMap::new();
-    server_map.insert("version".into(), Value::Int(VERSION));
-    server_map.insert("server_nonce".into(), Value::Bytes(server_nonce.clone()));
-    server_map.insert(
-        "server_x25519".into(),
-        Value::Bytes(x_public.as_bytes().to_vec()),
-    );
-    server_map.insert(
-        "mlkem_ciphertext".into(),
-        Value::Bytes(mlkem_ciphertext.as_slice().to_vec()),
-    );
-    server_map.insert("timestamp".into(), Value::Int(server_timestamp));
-    let server_unsigned = nmtb::marshal(&Value::Map(server_map))?;
-    let transcript = rekey_transcript(
-        &session.id,
-        epoch,
-        &client_unsigned,
-        &server_unsigned,
-        &client_nonce,
-        &server_nonce,
-    );
-    let (secp_signature, mldsa_signature) = keys.sign(&transcript)?;
-    let (c2s, s2c) = derive_rekey_keys(x_shared.as_bytes(), mlkem_shared.as_slice(), &transcript)?;
-
-    let mut response = BTreeMap::new();
-    response.insert("version".into(), Value::Int(VERSION));
-    response.insert("server_nonce".into(), Value::Bytes(server_nonce));
-    response.insert(
-        "server_x25519".into(),
-        Value::Bytes(x_public.as_bytes().to_vec()),
-    );
-    response.insert(
-        "mlkem_ciphertext".into(),
-        Value::Bytes(mlkem_ciphertext.as_slice().to_vec()),
-    );
-    response.insert("timestamp".into(), Value::Int(server_timestamp));
-    response.insert("signature_secp256k1".into(), Value::Bytes(secp_signature));
-    response.insert("signature_mldsa".into(), Value::Bytes(mldsa_signature));
-    response.insert("session_id".into(), Value::Bytes(session.id.to_vec()));
-    response.insert("epoch".into(), Value::Int(epoch as i64));
-    Ok(RekeyResult {
-        response: Value::Map(response),
-        send_key: s2c,
-        recv_key: c2s,
-    })
-}
-
 fn rekey_transcript(
     session_id: &[u8; 16],
     epoch: u64,
@@ -318,106 +215,4 @@ fn array_32(value: &[u8]) -> Result<[u8; 32], Error> {
     value
         .try_into()
         .map_err(|_| Error::Handshake("expected 32 bytes".into()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::certificate::Certificate;
-    use crate::handshake::{ClientHandshake, ServerHandshakeOptions, server_handshake};
-    use crate::session::{Kind, SessionPolicy};
-
-    fn now() -> i64 {
-        1_700_000_000_000
-    }
-
-    #[test]
-    fn rekey_round_trip() {
-        let issuer = ServerKeys::generate().unwrap();
-        let leaf = ServerKeys::generate().unwrap();
-        let certificate = Certificate::issue(
-            &leaf,
-            &issuer,
-            "server-1",
-            now() - 60_000,
-            now() + 3_600_000,
-        )
-        .unwrap()
-        .marshal()
-        .unwrap();
-        let (mut client, request) =
-            ClientHandshake::new(issuer.public(), now(), "server-1").unwrap();
-        let (response, mut server_session) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: None,
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        let mut client_session = client.finish(&response).unwrap();
-        client_session.set_clock(now);
-        server_session.set_clock(now);
-
-        let (mut rekey, payload) = RekeyClient::new(&client_session, leaf.public(), now()).unwrap();
-        let frame = client_session
-            .seal(Kind::Request, "session.rekey", 1, &payload)
-            .unwrap();
-        let opened = server_session.open(&frame).unwrap();
-        let result = server_rekey(&server_session, &opened.payload, &leaf, now()).unwrap();
-        let response_frame = server_session
-            .seal(Kind::Response, "session.rekey", 1, &result.response)
-            .unwrap();
-        let response = client_session.open(&response_frame).unwrap();
-        rekey
-            .finish(&mut client_session, &response.payload)
-            .unwrap();
-        server_session.rotate(result.send_key, result.recv_key, now());
-
-        assert_eq!(client_session.epoch(), 1);
-        assert_eq!(server_session.epoch(), 1);
-        let ping = client_session
-            .seal(Kind::Request, "ping", 2, &Value::Null)
-            .unwrap();
-        server_session.open(&ping).unwrap();
-    }
-
-    #[test]
-    fn stale_rekey_is_rejected() {
-        let issuer = ServerKeys::generate().unwrap();
-        let leaf = ServerKeys::generate().unwrap();
-        let certificate = Certificate::issue(
-            &leaf,
-            &issuer,
-            "server-1",
-            now() - 60_000,
-            now() + 3_600_000,
-        )
-        .unwrap()
-        .marshal()
-        .unwrap();
-        let (mut client, request) =
-            ClientHandshake::new(issuer.public(), now(), "server-1").unwrap();
-        let (response, server_session) = server_handshake(
-            &request,
-            ServerHandshakeOptions {
-                keys: &leaf,
-                certificate: &certificate,
-                replay_seen: None,
-                now_ms: now(),
-                policy: SessionPolicy::default(),
-            },
-        )
-        .unwrap();
-        let mut client_session = client.finish(&response).unwrap();
-        client_session.set_clock(now);
-        let (_, payload) = RekeyClient::new(&client_session, leaf.public(), now()).unwrap();
-        let mut map = payload.as_map().unwrap().clone();
-        map.insert("epoch".into(), Value::Int(99));
-        let stale = Value::Map(map);
-        assert!(server_rekey(&server_session, &stale, &leaf, now()).is_err());
-    }
 }
